@@ -425,6 +425,74 @@ fn find_java(
 }
 
 impl LaunchArguments {
+    pub fn resolve_assets_dir(session: &Session, official_mc_path: &Path) -> PathBuf {
+        session
+            .assets_path
+            .as_deref()
+            .map(|p| p.trim().trim_matches(['"', '\'']))
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| official_mc_path.join("assets"))
+    }
+
+    pub fn guarantee_assets_dir_and_subdirs(assets_dir: &Path) -> Result<(), String> {
+        let clean = assets_dir.to_string_lossy();
+        let clean_trimmed = clean.trim().trim_matches(['"', '\'']);
+        if clean_trimmed.is_empty() {
+            return Err("Assets directory path cannot be empty".to_string());
+        }
+        let target = Path::new(clean_trimmed);
+        fs::create_dir_all(target)
+            .map_err(|e| format!("Failed to create assets directory {:?}: {}", target, e))?;
+        let _ = fs::create_dir_all(target.join("indexes"));
+        let _ = fs::create_dir_all(target.join("objects"));
+        Ok(())
+    }
+
+    pub fn ensure_assets_dir_exists(assets_dir: &Path) -> Result<(), String> {
+        Self::guarantee_assets_dir_and_subdirs(assets_dir)
+    }
+
+    pub fn extract_assets_dir(minecraft_args: &[String]) -> Option<PathBuf> {
+        let mut result = None;
+        for (pos, a) in minecraft_args.iter().enumerate() {
+            if a == "--assetsDir" {
+                if let Some(p) = minecraft_args.get(pos + 1) {
+                    let clean = p.trim().trim_matches(['"', '\'']);
+                    if !clean.is_empty() && !clean.starts_with("--") {
+                        result = Some(PathBuf::from(clean));
+                    }
+                }
+            } else if let Some(stripped) = a.strip_prefix("--assetsDir=") {
+                let clean = stripped.trim().trim_matches(['"', '\'']);
+                if !clean.is_empty() {
+                    result = Some(PathBuf::from(clean));
+                }
+            }
+        }
+        result
+    }
+
+    pub fn extract_asset_index_id(minecraft_args: &[String]) -> Option<String> {
+        let mut result = None;
+        for (pos, a) in minecraft_args.iter().enumerate() {
+            if a == "--assetIndex" {
+                if let Some(id) = minecraft_args.get(pos + 1) {
+                    let clean = id.trim().trim_matches(['"', '\'']);
+                    if !clean.starts_with("--") && !clean.is_empty() {
+                        result = Some(clean.to_string());
+                    }
+                }
+            } else if let Some(stripped) = a.strip_prefix("--assetIndex=") {
+                let clean = stripped.trim().trim_matches(['"', '\'']);
+                if !clean.is_empty() {
+                    result = Some(clean.to_string());
+                }
+            }
+        }
+        result
+    }
+
     pub fn from_session(
         session: &Session,
         session_dir: &Path,
@@ -440,6 +508,12 @@ impl LaunchArguments {
             let home = std::env::var("HOME").map_err(|_| "Could not find HOME directory")?;
             PathBuf::from(home).join(".minecraft")
         };
+
+        // Resolve assets directory respecting session.assets_path and guarantee its existence on disk
+        let assets_dir = Self::resolve_assets_dir(session, &official_mc_path);
+        Self::ensure_assets_dir_exists(&assets_dir)?;
+        let _ = fs::create_dir_all(assets_dir.join("indexes"));
+        let _ = fs::create_dir_all(assets_dir.join("objects"));
 
         let version_id_owned = if let Some(forge_version) = &session.forge {
             format!("{}-forge-{}", session.minecraft, forge_version)
@@ -482,7 +556,11 @@ impl LaunchArguments {
                     if let Ok(parent_manifest) =
                         serde_json::from_str::<VersionManifest>(&parent_content)
                     {
-                        if manifest.asset_index.is_none() {
+                        let child_needs_asset_index = manifest
+                            .asset_index
+                            .as_ref()
+                            .map_or(true, |a| a.url.as_deref().unwrap_or("").trim().is_empty());
+                        if child_needs_asset_index && parent_manifest.asset_index.is_some() {
                             manifest.asset_index = parent_manifest.asset_index;
                         }
                         if manifest.java_version.is_none() {
@@ -732,8 +810,13 @@ impl LaunchArguments {
                 ),
                 (
                     "${assets_root}",
-                    official_mc_path
-                        .join("assets")
+                    assets_dir
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                (
+                    "${game_assets}",
+                    assets_dir
                         .to_string_lossy()
                         .to_string(),
                 ),
@@ -743,7 +826,13 @@ impl LaunchArguments {
                         .asset_index
                         .as_ref()
                         .map(|a| a.id.clone())
-                        .unwrap_or_else(|| "1.12".to_string()),
+                        .unwrap_or_else(|| {
+                            if !session.minecraft.is_empty() {
+                                session.minecraft.clone()
+                            } else {
+                                "1.12".to_string()
+                            }
+                        }),
                 ),
                 ("${auth_uuid}", auth.uuid.clone()),
                 ("${auth_access_token}", auth.access_token.clone()),
@@ -792,8 +881,13 @@ impl LaunchArguments {
                     ),
                     (
                         "${assets_root}",
-                        official_mc_path
-                            .join("assets")
+                        assets_dir
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    (
+                        "${game_assets}",
+                        assets_dir
                             .to_string_lossy()
                             .to_string(),
                     ),
@@ -803,7 +897,13 @@ impl LaunchArguments {
                             .asset_index
                             .as_ref()
                             .map(|a| a.id.clone())
-                            .unwrap_or_else(|| "1.12".to_string()),
+                            .unwrap_or_else(|| {
+                                if !session.minecraft.is_empty() {
+                                    session.minecraft.clone()
+                                } else {
+                                    "1.12".to_string()
+                                }
+                            }),
                     ),
                     ("${auth_uuid}", auth.uuid.clone()),
                     ("${auth_access_token}", auth.access_token.clone()),
@@ -817,13 +917,15 @@ impl LaunchArguments {
                     ("${resolution_height}", settings.game_resolution.split('x').nth(1).unwrap_or("480").to_string()),
                 ];
 
-                let mut result_line = arg_line;
-                for (placeholder, value) in map {
-                    result_line = result_line.replace(placeholder, &value);
-                }
-
-                for arg in result_line.split_whitespace() {
-                    minecraft_args.push(arg.to_string());
+                for raw_token in arg_line.split_whitespace() {
+                    let mut token = raw_token.to_string();
+                    for (placeholder, value) in &map {
+                        token = token.replace(placeholder, value);
+                    }
+                    if token.starts_with('"') && token.ends_with('"') && token.len() >= 2 {
+                        token = token[1..token.len() - 1].to_string();
+                    }
+                    minecraft_args.push(token);
                 }
             } else {
                 // Modern format or fallback
@@ -835,8 +937,7 @@ impl LaunchArguments {
                 minecraft_args.push(session_dir.to_string_lossy().to_string());
                 minecraft_args.push("--assetsDir".to_string());
                 minecraft_args.push(
-                    official_mc_path
-                        .join("assets")
+                    assets_dir
                         .to_string_lossy()
                         .to_string(),
                 );
@@ -846,7 +947,13 @@ impl LaunchArguments {
                         .asset_index
                         .as_ref()
                         .map(|a| a.id.clone())
-                        .unwrap_or_else(|| "1.12".to_string()),
+                        .unwrap_or_else(|| {
+                            if !session.minecraft.is_empty() {
+                                session.minecraft.clone()
+                            } else {
+                                "1.12".to_string()
+                            }
+                        }),
                 );
                 minecraft_args.push("--uuid".to_string());
                 minecraft_args.push(auth.uuid.clone());
@@ -886,23 +993,27 @@ impl LaunchArguments {
             minecraft_args.push("--gameDir".to_string());
             minecraft_args.push(session_dir.to_string_lossy().to_string());
         }
-        if !minecraft_args.iter().any(|a| a == "--assetsDir") {
+        if !minecraft_args.iter().any(|a| a == "--assetsDir" || a.starts_with("--assetsDir=")) {
             minecraft_args.push("--assetsDir".to_string());
             minecraft_args.push(
-                official_mc_path
-                    .join("assets")
+                assets_dir
                     .to_string_lossy()
                     .to_string(),
             );
         }
-        if !minecraft_args.iter().any(|a| a == "--assetIndex") {
+        if !minecraft_args.iter().any(|a| a == "--assetIndex" || a.starts_with("--assetIndex=")) {
+            let default_index = if !session.minecraft.is_empty() {
+                session.minecraft.clone()
+            } else {
+                "1.12".to_string()
+            };
             minecraft_args.push("--assetIndex".to_string());
             minecraft_args.push(
                 manifest
                     .asset_index
                     .as_ref()
                     .map(|a| a.id.clone())
-                    .unwrap_or_else(|| "1.12".to_string()),
+                    .unwrap_or(default_index),
             );
         }
         if !minecraft_args.iter().any(|a| a == "--uuid") {
@@ -928,6 +1039,90 @@ impl LaunchArguments {
                 && !a.starts_with("--quickPlay")
                 && !a.starts_with("${quickPlay")
         });
+
+        // Guarantee that the directory path passed to --assetsDir exists on disk (including subdirs) prior to process execution
+        let effective_assets_dir = Self::extract_assets_dir(&minecraft_args).unwrap_or_else(|| assets_dir.clone());
+        Self::guarantee_assets_dir_and_subdirs(&effective_assets_dir)?;
+
+        let default_index_fallback = if !session.minecraft.is_empty() {
+            session.minecraft.clone()
+        } else {
+            "1.12".to_string()
+        };
+
+        // Ensure asset index file is downloaded or created if missing.
+        // Priority: CLI argument value (what Minecraft will actually open) -> manifest assetIndex -> session.minecraft fallback
+        let resolved_index_id = Self::extract_asset_index_id(&minecraft_args)
+            .or_else(|| manifest.asset_index.as_ref().map(|a| a.id.clone()))
+            .unwrap_or(default_index_fallback);
+
+        let index_path = effective_assets_dir
+            .join("indexes")
+            .join(format!("{}.json", resolved_index_id));
+
+        let is_corrupted_or_missing = !index_path.exists()
+            || fs::metadata(&index_path).map(|m| m.len() == 0).unwrap_or(true)
+            || match fs::read_to_string(&index_path) {
+                Ok(content) => match serde_json::from_str::<Value>(&content) {
+                    Ok(val) => {
+                        if manifest.asset_index.as_ref().and_then(|a| a.url.as_deref()).map_or(false, |u| !u.trim().is_empty()) {
+                            val.get("objects").and_then(|o| o.as_object()).map_or(true, |o| o.is_empty())
+                        } else {
+                            false
+                        }
+                    }
+                    Err(_) => true,
+                },
+                Err(_) => true,
+            };
+
+        if is_corrupted_or_missing {
+            if let Some(parent) = index_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+
+            let mut downloaded = false;
+            if let Some(ref asset_index) = manifest.asset_index {
+                if let Some(ref url) = asset_index.url {
+                    let trimmed_url = url.trim();
+                    if !trimmed_url.is_empty() {
+                        if let Ok(resp) = ureq::get(trimmed_url)
+                            .timeout(std::time::Duration::from_secs(10))
+                            .call()
+                        {
+                            if resp.status() == 200 {
+                                if let Ok(text) = resp.into_string() {
+                                    if !text.trim().is_empty()
+                                        && serde_json::from_str::<Value>(&text).is_ok()
+                                    {
+                                        if let Ok(_) = fs::write(&index_path, &text) {
+                                            downloaded = true;
+                                            let manifest_index_path = effective_assets_dir
+                                                .join("indexes")
+                                                .join(format!("{}.json", asset_index.id));
+                                            if manifest_index_path != index_path && !manifest_index_path.exists() {
+                                                let _ = fs::write(&manifest_index_path, &text);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback: If index could not be downloaded and does not exist on disk, create minimal index
+            if !downloaded
+                && (!index_path.exists()
+                    || fs::metadata(&index_path).map(|m| m.len() == 0).unwrap_or(true)
+                    || fs::read_to_string(&index_path)
+                        .map(|s| serde_json::from_str::<Value>(&s).is_err())
+                        .unwrap_or(true))
+            {
+                let _ = fs::write(&index_path, r#"{"objects":{}}"#);
+            }
+        }
 
         // Find correct Java version (MC 1.12.2 needs Java 8)
         let required_java = manifest

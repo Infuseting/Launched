@@ -1,7 +1,12 @@
+use app_lib::core::install::assets::AssetManager;
+use app_lib::core::install::mojang::VersionDetail;
 use app_lib::core::install::runtime::JreManager;
+use app_lib::core::launch::args::LaunchArguments;
+use app_lib::core::launch::models::VersionManifest;
 use app_lib::core::meta::models::*;
 use app_lib::core::meta::prism::PrismMetaClient;
 use app_lib::core::session::{ComponentSpec, Session};
+use std::path::PathBuf;
 
 
 #[test]
@@ -329,5 +334,567 @@ fn test_minecraft_arguments_spaces_preservation() {
     assert_eq!(args[4], "--gameDir");
     assert_eq!(args[5], "C:\\Sessions\\Stolbovo RP"); // Preserved whole!
 }
+
+#[test]
+fn test_assets_directory_pre_launch_guarantee() {
+    let test_dir = std::env::temp_dir().join(format!("test_assets_guarantee_{}", uuid::Uuid::new_v4().simple()));
+    let nonexistent_assets = test_dir.join("missing_parent").join("assets");
+
+    assert!(!nonexistent_assets.exists(), "Target assets dir must not exist initially");
+
+    // Call ensure_assets_dir_exists
+    let res = LaunchArguments::ensure_assets_dir_exists(&nonexistent_assets);
+    assert!(res.is_ok(), "ensure_assets_dir_exists should succeed: {:?}", res.err());
+    assert!(nonexistent_assets.exists(), "Target assets dir must exist on disk after guarantee call");
+
+    // Call again on already-existing directory
+    let res_again = LaunchArguments::ensure_assets_dir_exists(&nonexistent_assets);
+    assert!(res_again.is_ok(), "ensure_assets_dir_exists on existing dir should succeed");
+
+    // Clean up
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn test_session_assets_path_customization_and_fallback() {
+    let official_mc_path = PathBuf::from("/mock/minecraft");
+
+    // 1. Explicit custom assets path
+    let session_custom = Session {
+        name: "Custom Assets Session".to_string(),
+        minecraft: "1.20.1".to_string(),
+        forge: None,
+        fabric: None,
+        neoforge: None,
+        quilt: None,
+        components: None,
+        sync_dir: "mods".to_string(),
+        sync_url: "https://example.com/sync".to_string(),
+        welcome: "Welcome".to_string(),
+        jvm_arg: "".to_string(),
+        credits: "".to_string(),
+        assets_path: Some("/custom/assets/directory".to_string()),
+        hostname: None,
+        is_default: false,
+        links: None,
+        crack: None,
+    };
+
+    let resolved_custom = LaunchArguments::resolve_assets_dir(&session_custom, &official_mc_path);
+    assert_eq!(resolved_custom, PathBuf::from("/custom/assets/directory"));
+
+    // 2. None -> fallback to official .minecraft/assets
+    let session_default = Session {
+        name: "Default Assets Session".to_string(),
+        minecraft: "1.20.1".to_string(),
+        forge: None,
+        fabric: None,
+        neoforge: None,
+        quilt: None,
+        components: None,
+        sync_dir: "mods".to_string(),
+        sync_url: "https://example.com/sync".to_string(),
+        welcome: "Welcome".to_string(),
+        jvm_arg: "".to_string(),
+        credits: "".to_string(),
+        assets_path: None,
+        hostname: None,
+        is_default: false,
+        links: None,
+        crack: None,
+    };
+
+    let resolved_default = LaunchArguments::resolve_assets_dir(&session_default, &official_mc_path);
+    assert_eq!(resolved_default, official_mc_path.join("assets"));
+
+    // 3. Whitespace string -> fallback to official .minecraft/assets
+    let session_whitespace = Session {
+        name: "Whitespace Assets Session".to_string(),
+        minecraft: "1.20.1".to_string(),
+        forge: None,
+        fabric: None,
+        neoforge: None,
+        quilt: None,
+        components: None,
+        sync_dir: "mods".to_string(),
+        sync_url: "https://example.com/sync".to_string(),
+        welcome: "Welcome".to_string(),
+        jvm_arg: "".to_string(),
+        credits: "".to_string(),
+        assets_path: Some("   ".to_string()),
+        hostname: None,
+        is_default: false,
+        links: None,
+        crack: None,
+    };
+
+    let resolved_ws = LaunchArguments::resolve_assets_dir(&session_whitespace, &official_mc_path);
+    assert_eq!(resolved_ws, official_mc_path.join("assets"));
+
+    // 4. Whitespace-padded custom assets path -> trimmed cleanly
+    let session_padded = Session {
+        name: "Padded Assets Session".to_string(),
+        minecraft: "1.20.1".to_string(),
+        forge: None,
+        fabric: None,
+        neoforge: None,
+        quilt: None,
+        components: None,
+        sync_dir: "mods".to_string(),
+        sync_url: "https://example.com/sync".to_string(),
+        welcome: "Welcome".to_string(),
+        jvm_arg: "".to_string(),
+        credits: "".to_string(),
+        assets_path: Some("   /custom/assets/directory   ".to_string()),
+        hostname: None,
+        is_default: false,
+        links: None,
+        crack: None,
+    };
+
+    let resolved_padded = LaunchArguments::resolve_assets_dir(&session_padded, &official_mc_path);
+    assert_eq!(resolved_padded, PathBuf::from("/custom/assets/directory"));
+
+    // 5. Quoted custom assets path -> quotes stripped
+    let session_quoted = Session {
+        name: "Quoted Assets Session".to_string(),
+        minecraft: "1.20.1".to_string(),
+        forge: None,
+        fabric: None,
+        neoforge: None,
+        quilt: None,
+        components: None,
+        sync_dir: "mods".to_string(),
+        sync_url: "https://example.com/sync".to_string(),
+        welcome: "Welcome".to_string(),
+        jvm_arg: "".to_string(),
+        credits: "".to_string(),
+        assets_path: Some("\"/custom/assets/directory\"".to_string()),
+        hostname: None,
+        is_default: false,
+        links: None,
+        crack: None,
+    };
+
+    let resolved_quoted = LaunchArguments::resolve_assets_dir(&session_quoted, &official_mc_path);
+    assert_eq!(resolved_quoted, PathBuf::from("/custom/assets/directory"));
+}
+
+#[test]
+fn test_ensure_assets_dir_exists_empty_fails() {
+    let empty_path = PathBuf::from("");
+    assert!(LaunchArguments::ensure_assets_dir_exists(&empty_path).is_err());
+
+    let ws_path = PathBuf::from("   ");
+    assert!(LaunchArguments::ensure_assets_dir_exists(&ws_path).is_err());
+}
+
+#[test]
+fn test_mojang_version_detail_deserializes_asset_index() {
+    let raw_json = r#"{
+        "assetIndex": {
+            "id": "1.20",
+            "sha1": "0123456789abcdef0123456789abcdef01234567",
+            "size": 398284,
+            "totalSize": 673238472,
+            "url": "https://piston-meta.mojang.com/v1/packages/0123456789abcdef0123456789abcdef01234567/1.20.json"
+        },
+        "downloads": {
+            "client": {
+                "sha1": "client_sha1",
+                "size": 123456,
+                "url": "https://example.com/client.jar"
+            }
+        }
+    }"#;
+
+    let detail: Result<VersionDetail, _> = serde_json::from_str(raw_json);
+    assert!(detail.is_ok(), "Failed to parse VersionDetail: {:?}", detail.err());
+    let detail = detail.unwrap();
+    assert!(detail.asset_index.is_some(), "assetIndex must be parsed");
+    let asset_index = detail.asset_index.unwrap();
+    assert_eq!(asset_index.id, "1.20");
+    assert_eq!(asset_index.sha1.as_deref(), Some("0123456789abcdef0123456789abcdef01234567"));
+    assert_eq!(asset_index.size, Some(398284));
+    assert_eq!(asset_index.total_size, Some(673238472));
+    assert_eq!(
+        asset_index.url.as_deref(),
+        Some("https://piston-meta.mojang.com/v1/packages/0123456789abcdef0123456789abcdef01234567/1.20.json")
+    );
+}
+
+#[test]
+fn test_version_manifest_deserializes_asset_index_without_url() {
+    let raw_json = r#"{
+        "id": "1.20.1-forge-47.2.0",
+        "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+        "libraries": [],
+        "assetIndex": {
+            "id": "1.20"
+        }
+    }"#;
+
+    let manifest: Result<VersionManifest, _> = serde_json::from_str(raw_json);
+    assert!(manifest.is_ok(), "Manifest with assetIndex lacking url must parse: {:?}", manifest.err());
+    let manifest = manifest.unwrap();
+    assert!(manifest.asset_index.is_some());
+    let ai = manifest.asset_index.unwrap();
+    assert_eq!(ai.id, "1.20");
+    assert_eq!(ai.url, None);
+}
+
+#[tokio::test]
+async fn test_asset_manager_directories_and_index_file_placement() {
+    let test_root = std::env::temp_dir().join(format!("test_assets_mgr_{}", uuid::Uuid::new_v4().simple()));
+    let custom_assets = test_root.join("custom_assets");
+
+    // Test AssetManager path resolution
+    let mgr_custom = AssetManager::new_with_assets_dir(custom_assets.clone());
+    assert_eq!(mgr_custom.assets_dir(), &custom_assets);
+
+    let mc_root = test_root.join(".minecraft");
+    let mgr_mc = AssetManager::new(mc_root.clone());
+    assert_eq!(mgr_mc.assets_dir(), &mc_root.join("assets"));
+
+    // Write a mock index file to simulate already-fetched or placed index
+    let index_dir = custom_assets.join("indexes");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    let index_file = index_dir.join("test_index.json");
+    std::fs::write(&index_file, r#"{"objects": {}}"#).unwrap();
+
+    let asset_ref = AssetIndexReference {
+        id: "test_index".to_string(),
+        sha1: None,
+        size: None,
+        url: None,
+        total_size: None,
+    };
+
+    let res = mgr_custom.ensure_assets(None, &asset_ref).await;
+    assert!(res.is_ok(), "ensure_assets should succeed with existing index file: {:?}", res.err());
+
+    // Assert that indexes and objects directories exist
+    assert!(custom_assets.join("indexes").exists());
+    assert!(custom_assets.join("objects").exists());
+    assert!(index_file.exists());
+
+    let _ = std::fs::remove_dir_all(&test_root);
+}
+
+#[tokio::test]
+async fn test_asset_manager_recovers_from_empty_corrupted_index_file() {
+    let test_root = std::env::temp_dir().join(format!("test_assets_recover_{}", uuid::Uuid::new_v4().simple()));
+    let custom_assets = test_root.join("custom_assets");
+    let mgr = AssetManager::new_with_assets_dir(custom_assets.clone());
+
+    // Pre-create a 0-byte corrupt index file
+    let index_dir = custom_assets.join("indexes");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    let index_file = index_dir.join("corrupt_index.json");
+    std::fs::write(&index_file, "").unwrap(); // Empty file
+
+    let asset_ref = AssetIndexReference {
+        id: "corrupt_index".to_string(),
+        sha1: None,
+        size: None,
+        url: None,
+        total_size: None,
+    };
+
+    // ensure_assets should detect empty/missing and write a valid fallback without failing
+    let res = mgr.ensure_assets(None, &asset_ref).await;
+    assert!(res.is_ok(), "ensure_assets should recover from empty index file: {:?}", res.err());
+    assert!(index_file.exists());
+    let content = std::fs::read_to_string(&index_file).unwrap();
+    assert_eq!(content, r#"{"objects":{}}"#);
+
+    let _ = std::fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn test_session_deserialization_assets_path_alias() {
+    let json_camel = r#"{
+        "name": "Camel Session",
+        "minecraft": "1.20.1",
+        "syncDir": "mods",
+        "syncUrl": "https://example.com/sync",
+        "welcome": "Hi",
+        "jvmArg": "",
+        "credits": "",
+        "isDefault": false,
+        "assetsPath": "/path/to/camel"
+    }"#;
+    let s_camel: Session = serde_json::from_str(json_camel).unwrap();
+    assert_eq!(s_camel.assets_path.as_deref(), Some("/path/to/camel"));
+
+    let json_snake = r#"{
+        "name": "Snake Session",
+        "minecraft": "1.20.1",
+        "syncDir": "mods",
+        "syncUrl": "https://example.com/sync",
+        "welcome": "Hi",
+        "jvmArg": "",
+        "credits": "",
+        "isDefault": false,
+        "assets_path": "/path/to/snake"
+    }"#;
+    let s_snake: Session = serde_json::from_str(json_snake).unwrap();
+    assert_eq!(s_snake.assets_path.as_deref(), Some("/path/to/snake"));
+}
+
+#[tokio::test]
+async fn test_asset_manager_replaces_dummy_index_when_checksum_provided() {
+    let test_root = std::env::temp_dir().join(format!("test_assets_dummy_{}", uuid::Uuid::new_v4().simple()));
+    let custom_assets = test_root.join("custom_assets");
+    let index_dir = custom_assets.join("indexes");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    let index_file = index_dir.join("test_dummy.json");
+
+    // Write dummy fallback
+    std::fs::write(&index_file, r#"{"objects":{}}"#).unwrap();
+
+    // Check validity against a real expected size & sha1
+    let expected_sha1 = Some(app_lib::core::download::Checksum::Sha1(
+        "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string(),
+    ));
+    let is_valid = app_lib::core::download::DownloadEngine::is_file_valid(
+        &index_file,
+        Some(12345),
+        &expected_sha1,
+    )
+    .await;
+
+    // Dummy index of 14 bytes should NOT be considered valid when expected size is 12345
+    assert!(!is_valid, "Dummy fallback index must not pass validity check when real size/checksum expected");
+
+    let _ = std::fs::remove_dir_all(&test_root);
+}
+
+#[test]
+fn test_launch_arguments_parses_asset_index_flag_variants() {
+    let args_space = vec![
+        "--username".to_string(),
+        "Player".to_string(),
+        "--assetIndex".to_string(),
+        "1.20.1".to_string(),
+    ];
+    assert_eq!(
+        LaunchArguments::extract_asset_index_id(&args_space),
+        Some("1.20.1".to_string())
+    );
+
+    let args_equals = vec![
+        "--username".to_string(),
+        "Player".to_string(),
+        "--assetIndex=1.20.1".to_string(),
+    ];
+    assert_eq!(
+        LaunchArguments::extract_asset_index_id(&args_equals),
+        Some("1.20.1".to_string())
+    );
+
+    let args_quoted = vec![
+        "--assetIndex=\"1.20.1\"".to_string(),
+    ];
+    assert_eq!(
+        LaunchArguments::extract_asset_index_id(&args_quoted),
+        Some("1.20.1".to_string())
+    );
+
+    let args_missing = vec![
+        "--username".to_string(),
+        "Player".to_string(),
+    ];
+    assert_eq!(LaunchArguments::extract_asset_index_id(&args_missing), None);
+
+    let args_next_flag = vec![
+        "--assetIndex".to_string(),
+        "--gameDir".to_string(),
+    ];
+    assert_eq!(LaunchArguments::extract_asset_index_id(&args_next_flag), None);
+
+    // Sequential override: last valid flag wins, matching joptsimple OptionSet.valueOf semantics
+    let args_sequential = vec![
+        "--assetIndex".to_string(),
+        "1.20".to_string(),
+        "--assetIndex".to_string(),
+        "1.20.1".to_string(),
+    ];
+    assert_eq!(
+        LaunchArguments::extract_asset_index_id(&args_sequential),
+        Some("1.20.1".to_string())
+    );
+
+    // Trailing flag without value or followed by another flag should NOT clobber previous valid value
+    let args_trailing_invalid = vec![
+        "--assetIndex".to_string(),
+        "1.20.1".to_string(),
+        "--assetIndex".to_string(),
+        "--gameDir".to_string(),
+    ];
+    assert_eq!(
+        LaunchArguments::extract_asset_index_id(&args_trailing_invalid),
+        Some("1.20.1".to_string())
+    );
+}
+
+#[test]
+fn test_launch_arguments_extracts_assets_dir_variants() {
+    let args_space = vec![
+        "--username".to_string(),
+        "Player".to_string(),
+        "--assetsDir".to_string(),
+        "/path/to/assets".to_string(),
+    ];
+    assert_eq!(
+        LaunchArguments::extract_assets_dir(&args_space),
+        Some(PathBuf::from("/path/to/assets"))
+    );
+
+    let args_equals = vec![
+        "--assetsDir=/path/to/assets".to_string(),
+    ];
+    assert_eq!(
+        LaunchArguments::extract_assets_dir(&args_equals),
+        Some(PathBuf::from("/path/to/assets"))
+    );
+
+    let args_quoted = vec![
+        "--assetsDir=\"/path/to/assets\"".to_string(),
+    ];
+    assert_eq!(
+        LaunchArguments::extract_assets_dir(&args_quoted),
+        Some(PathBuf::from("/path/to/assets"))
+    );
+
+    // Sequential override: last valid flag wins, matching joptsimple OptionSet.valueOf semantics
+    let args_sequential = vec![
+        "--assetsDir".to_string(),
+        "/first/path".to_string(),
+        "--assetsDir=/second/path".to_string(),
+    ];
+    assert_eq!(
+        LaunchArguments::extract_assets_dir(&args_sequential),
+        Some(PathBuf::from("/second/path"))
+    );
+
+    // Trailing flag without value or followed by another flag should NOT clobber previous valid value
+    let args_trailing_invalid = vec![
+        "--assetsDir".to_string(),
+        "/valid/path".to_string(),
+        "--assetsDir".to_string(),
+        "--gameDir".to_string(),
+    ];
+    assert_eq!(
+        LaunchArguments::extract_assets_dir(&args_trailing_invalid),
+        Some(PathBuf::from("/valid/path"))
+    );
+}
+
+#[tokio::test]
+async fn test_asset_manager_recovers_from_corrupt_html_index_file() {
+    let test_dir = std::env::temp_dir().join(format!("test_corrupt_index_{}", uuid::Uuid::new_v4().simple()));
+    let index_dir = test_dir.join("indexes");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    let index_file = index_dir.join("corrupt.json");
+
+    // Write corrupt non-JSON (e.g. HTML error page)
+    std::fs::write(&index_file, "<!DOCTYPE html><html><body>502 Bad Gateway</body></html>").unwrap();
+
+    let mgr = AssetManager::new_with_assets_dir(test_dir.clone());
+    let asset_ref = AssetIndexReference {
+        id: "corrupt".to_string(),
+        sha1: None,
+        size: None,
+        url: None,
+        total_size: None,
+    };
+
+    // AssetManager::ensure_assets must detect corrupt HTML and recover with valid JSON fallback
+    let res = mgr.ensure_assets(None, &asset_ref).await;
+    assert!(res.is_ok(), "ensure_assets must succeed when recovering from corrupt HTML index: {:?}", res.err());
+
+    let recovered_content = std::fs::read_to_string(&index_file).unwrap();
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&recovered_content);
+    assert!(parsed.is_ok(), "Recovered index must be valid JSON");
+    assert!(parsed.unwrap().get("objects").is_some(), "Recovered index must contain objects key");
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn test_launch_service_assets_dir_guarantee_creates_subdirectories() {
+    let test_dir = std::env::temp_dir().join(format!("test_launch_subdirs_{}", uuid::Uuid::new_v4().simple()));
+    let assets_dir = test_dir.join("mc_assets");
+
+    assert!(!assets_dir.exists());
+
+    let minecraft_args = vec![
+        "--username".to_string(),
+        "Player".to_string(),
+        "--assetsDir".to_string(),
+        assets_dir.to_string_lossy().to_string(),
+    ];
+
+    let extracted = LaunchArguments::extract_assets_dir(&minecraft_args);
+    assert_eq!(extracted, Some(assets_dir.clone()));
+
+    let guarantee_res = LaunchArguments::guarantee_assets_dir_and_subdirs(&extracted.unwrap());
+    assert!(guarantee_res.is_ok());
+
+    assert!(assets_dir.exists(), "Root assetsDir must exist");
+    assert!(assets_dir.join("indexes").exists(), "indexes directory must exist");
+    assert!(assets_dir.join("objects").exists(), "objects directory must exist");
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[tokio::test]
+async fn test_asset_manager_handles_empty_placeholder_with_url() {
+    let test_dir = std::env::temp_dir().join(format!("test_placeholder_upgrade_{}", uuid::Uuid::new_v4().simple()));
+    let index_dir = test_dir.join("indexes");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    let index_file = index_dir.join("placeholder_test.json");
+
+    // Write minimal empty placeholder (such as created by offline fallback)
+    std::fs::write(&index_file, r#"{"objects":{}}"#).unwrap();
+
+    let mgr = AssetManager::new_with_assets_dir(test_dir.clone());
+    let asset_ref = AssetIndexReference {
+        id: "placeholder_test".to_string(),
+        sha1: None,
+        size: None,
+        // Unreachable local port to simulate network failure after clearing placeholder
+        url: Some("http://127.0.0.1:1/unreachable.json".to_string()),
+        total_size: None,
+    };
+
+    // ensure_assets should recognize the placeholder, attempt download, handle network failure cleanly,
+    // and guarantee a valid fallback exists on disk
+    let res = mgr.ensure_assets(None, &asset_ref).await;
+    assert!(res.is_ok(), "ensure_assets must succeed gracefully: {:?}", res.err());
+    assert!(index_file.exists(), "Index file must exist on disk");
+
+    let content = std::fs::read_to_string(&index_file).unwrap();
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&content);
+    assert!(parsed.is_ok(), "Index must be valid JSON");
+    assert!(parsed.unwrap().get("objects").is_some());
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn test_guarantee_assets_dir_and_subdirs_empty_path_errors() {
+    let empty = PathBuf::from("");
+    assert!(LaunchArguments::guarantee_assets_dir_and_subdirs(&empty).is_err());
+
+    let whitespace = PathBuf::from("   ");
+    assert!(LaunchArguments::guarantee_assets_dir_and_subdirs(&whitespace).is_err());
+
+    let quotes_only = PathBuf::from("\"\"");
+    assert!(LaunchArguments::guarantee_assets_dir_and_subdirs(&quotes_only).is_err());
+}
+
+
 
 

@@ -60,8 +60,10 @@ pub struct OsCondition {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AssetIndex {
     pub id: String,
-    pub url: String,
+    #[serde(default)]
+    pub url: Option<String>,
 }
+

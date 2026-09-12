@@ -3,6 +3,8 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use crate::core::install::assets::AssetManager;
+use crate::core::meta::models::AssetIndexReference;
 use crate::core::retry::retry_with_backoff;
 
 const VERSION_MANIFEST_URL: &str = "https://launchermeta.mojang.com/mc/game/version_manifest.json";
@@ -26,6 +28,8 @@ pub struct VersionDetail {
     pub libraries: Option<Vec<InstallLibrary>>,
     #[serde(rename = "javaVersion")]
     pub java_version: Option<JavaVersionRequirement>,
+    #[serde(rename = "assetIndex")]
+    pub asset_index: Option<AssetIndexReference>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,8 +249,17 @@ pub async fn is_installed(version: &str) -> bool {
     }
 }
 
-/// Installs Minecraft version: JSON, client JAR, and all required libraries.
+/// Installs Minecraft version: JSON, client JAR, all required libraries, JRE, and game assets.
 pub async fn install_version(version: &str) -> Result<(), String> {
+    install_version_with_assets(version, None, None).await
+}
+
+/// Installs Minecraft version with explicit assets directory and optional progress window.
+pub async fn install_version_with_assets(
+    version: &str,
+    assets_dir: Option<&std::path::Path>,
+    window: Option<&tauri::Window>,
+) -> Result<(), String> {
     let client = Client::new();
     let mc_path = get_official_mc_path().await?;
     let version_dir = mc_path.join("versions").join(version);
@@ -402,6 +415,37 @@ pub async fn install_version(version: &str) -> Result<(), String> {
     } else {
         // Default to jre-legacy (Java 8) for older versions if not specified
         download_jre("jre-legacy").await?;
+    }
+
+    // ── Step 7: Ensure game assets and asset index are downloaded ───────────────
+    let effective_assets_dir = match assets_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => mc_path.join("assets"),
+    };
+    fs::create_dir_all(&effective_assets_dir)
+        .await
+        .map_err(|e| format!("Failed to create assets directory {:?}: {}", effective_assets_dir, e))?;
+    let _ = fs::create_dir_all(effective_assets_dir.join("indexes")).await;
+    let _ = fs::create_dir_all(effective_assets_dir.join("objects")).await;
+
+    if let Some(ref asset_index_ref) = detail.asset_index {
+        log::info!(
+            "Ensuring game assets for {} (index: {}) in {:?}",
+            version,
+            asset_index_ref.id,
+            effective_assets_dir
+        );
+
+        let asset_manager = AssetManager::new_with_assets_dir(effective_assets_dir);
+        asset_manager.ensure_assets(window, asset_index_ref).await?;
+    } else {
+        let default_index = effective_assets_dir.join("indexes").join(format!("{}.json", version));
+        let needs_fallback = !default_index.exists()
+            || fs::metadata(&default_index).await.map(|m| m.len() == 0).unwrap_or(true)
+            || fs::read_to_string(&default_index).await.map(|s| serde_json::from_str::<serde_json::Value>(&s).is_err()).unwrap_or(true);
+        if needs_fallback {
+            let _ = fs::write(&default_index, r#"{"objects":{}}"#).await;
+        }
     }
 
     Ok(())

@@ -19,6 +19,12 @@ impl LaunchService {
      * Launches the game process.
      */
     pub fn launch(&self, args: LaunchArguments, show_logs: bool, app_handle: &tauri::AppHandle) -> Result<(), String> {
+        // Guarantee that the directory path passed to --assetsDir exists on disk prior to process execution
+        if let Some(assets_dir) = LaunchArguments::extract_assets_dir(&args.minecraft_args) {
+            LaunchArguments::guarantee_assets_dir_and_subdirs(&assets_dir)
+                .map_err(|e| format!("Cannot launch: failed to guarantee assets directory {:?}: {}", assets_dir.display(), e))?;
+        }
+
         let jvm_args = args.build();
         
         let log_file_path = args.game_dir.join("launcher_debug.log");

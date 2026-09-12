@@ -1,5 +1,7 @@
+pub mod download;
 pub mod install;
 pub mod launch;
+pub mod meta;
 pub mod session;
 pub mod skin;
 pub mod sync;
