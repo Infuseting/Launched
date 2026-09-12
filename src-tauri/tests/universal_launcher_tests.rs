@@ -478,6 +478,30 @@ fn test_session_assets_path_customization_and_fallback() {
 
     let resolved_quoted = LaunchArguments::resolve_assets_dir(&session_quoted, &official_mc_path);
     assert_eq!(resolved_quoted, PathBuf::from("/custom/assets/directory"));
+
+    // 6. Remote URL / assets.json (launcher UI metadata) -> ignored and falls back to official .minecraft/assets
+    let session_url = Session {
+        name: "Remote URL Assets Session".to_string(),
+        minecraft: "1.20.1".to_string(),
+        forge: None,
+        fabric: None,
+        neoforge: None,
+        quilt: None,
+        components: None,
+        sync_dir: "mods".to_string(),
+        sync_url: "https://example.com/sync".to_string(),
+        welcome: "Welcome".to_string(),
+        jvm_arg: "".to_string(),
+        credits: "".to_string(),
+        assets_path: Some("https://galade.fr/launched/stolbovo/assets.json".to_string()),
+        hostname: None,
+        is_default: false,
+        links: None,
+        crack: None,
+    };
+
+    let resolved_url = LaunchArguments::resolve_assets_dir(&session_url, &official_mc_path);
+    assert_eq!(resolved_url, official_mc_path.join("assets"));
 }
 
 #[test]

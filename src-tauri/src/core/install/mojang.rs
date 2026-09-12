@@ -419,7 +419,18 @@ pub async fn install_version_with_assets(
 
     // ── Step 7: Ensure game assets and asset index are downloaded ───────────────
     let effective_assets_dir = match assets_dir {
-        Some(dir) => dir.to_path_buf(),
+        Some(dir) => {
+            let str_val = dir.to_string_lossy();
+            if str_val.starts_with("http://")
+                || str_val.starts_with("https://")
+                || str_val.contains("://")
+                || str_val.ends_with(".json")
+            {
+                mc_path.join("assets")
+            } else {
+                dir.to_path_buf()
+            }
+        }
         None => mc_path.join("assets"),
     };
     fs::create_dir_all(&effective_assets_dir)

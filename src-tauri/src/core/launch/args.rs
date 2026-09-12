@@ -426,20 +426,30 @@ fn find_java(
 
 impl LaunchArguments {
     pub fn resolve_assets_dir(session: &Session, official_mc_path: &Path) -> PathBuf {
-        session
-            .assets_path
-            .as_deref()
-            .map(|p| p.trim().trim_matches(['"', '\'']))
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| official_mc_path.join("assets"))
+        if let Some(p) = &session.assets_path {
+            let clean = p.trim().trim_matches(['"', '\'']);
+            if !clean.is_empty()
+                && !clean.starts_with("http://")
+                && !clean.starts_with("https://")
+                && !clean.contains("://")
+                && !clean.ends_with(".json")
+            {
+                return PathBuf::from(clean);
+            }
+        }
+        official_mc_path.join("assets")
     }
 
     pub fn guarantee_assets_dir_and_subdirs(assets_dir: &Path) -> Result<(), String> {
         let clean = assets_dir.to_string_lossy();
         let clean_trimmed = clean.trim().trim_matches(['"', '\'']);
-        if clean_trimmed.is_empty() {
-            return Err("Assets directory path cannot be empty".to_string());
+        if clean_trimmed.is_empty()
+            || clean_trimmed.starts_with("http://")
+            || clean_trimmed.starts_with("https://")
+            || clean_trimmed.contains("://")
+            || clean_trimmed.ends_with(".json")
+        {
+            return Ok(());
         }
         let target = Path::new(clean_trimmed);
         fs::create_dir_all(target)
@@ -459,13 +469,24 @@ impl LaunchArguments {
             if a == "--assetsDir" {
                 if let Some(p) = minecraft_args.get(pos + 1) {
                     let clean = p.trim().trim_matches(['"', '\'']);
-                    if !clean.is_empty() && !clean.starts_with("--") {
+                    if !clean.is_empty()
+                        && !clean.starts_with("--")
+                        && !clean.starts_with("http://")
+                        && !clean.starts_with("https://")
+                        && !clean.contains("://")
+                        && !clean.ends_with(".json")
+                    {
                         result = Some(PathBuf::from(clean));
                     }
                 }
             } else if let Some(stripped) = a.strip_prefix("--assetsDir=") {
                 let clean = stripped.trim().trim_matches(['"', '\'']);
-                if !clean.is_empty() {
+                if !clean.is_empty()
+                    && !clean.starts_with("http://")
+                    && !clean.starts_with("https://")
+                    && !clean.contains("://")
+                    && !clean.ends_with(".json")
+                {
                     result = Some(PathBuf::from(clean));
                 }
             }
