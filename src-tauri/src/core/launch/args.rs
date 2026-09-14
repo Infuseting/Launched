@@ -232,7 +232,7 @@ fn ensure_pointblank_effect_hotfix(session_dir: &Path) {
 
 /// Finds the best Java binary for the given required major version.
 /// Prefers exact match, falls back to any available java.
-fn find_java(
+pub(crate) fn find_java(
     required_major: Option<u8>,
     mc_path: &Path,
 ) -> Result<(u8, PathBuf, Option<PathBuf>), String> {
@@ -559,6 +559,25 @@ impl LaunchArguments {
                 "Version JSON not found at {:?}. Please ensure the version is installed.",
                 version_json_path
             ));
+        }
+
+        if let Some(forge_version) = &session.forge {
+            if !crate::core::install::forge::is_legacy_forge_layout(&session.minecraft) {
+                let forge_client_jar = official_mc_path
+                    .join("libraries")
+                    .join("net")
+                    .join("minecraftforge")
+                    .join("forge")
+                    .join(format!("{}-{}", session.minecraft, forge_version))
+                    .join(format!("forge-{}-{}-client.jar", session.minecraft, forge_version));
+
+                if !forge_client_jar.exists() {
+                    return Err(format!(
+                        "Modern Forge client JAR missing at {:?}. Please re-sync the session to complete Forge installation.",
+                        forge_client_jar
+                    ));
+                }
+            }
         }
 
         let content = fs::read_to_string(&version_json_path)

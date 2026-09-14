@@ -283,7 +283,7 @@ impl ForgeVersionInstallStrategy for ModernForgeInstallStrategy {
             .join(&ctx.mc_version)
             .join(format!("{}.json", ctx.mc_version));
             
-        let mut java_component = "jre-legacy".to_string();
+        let mut comp_from_json = None;
         if vanilla_json_path.exists() {
             if let Ok(content) = fs::read_to_string(&vanilla_json_path) {
                 if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
@@ -292,30 +292,69 @@ impl ForgeVersionInstallStrategy for ModernForgeInstallStrategy {
                         .and_then(|j| j.get("component"))
                         .and_then(|c| c.as_str())
                     {
-                        java_component = comp.to_string();
+                        comp_from_json = Some(comp.to_string());
                     }
                 }
             }
         }
 
-        // 2. Download/Ensure JRE is available
-        let jre_path = crate::core::install::mojang::download_jre(&java_component).await?;
-        let java_bin = if cfg!(windows) {
-            jre_path.join("bin/java.exe")
+        let java_component = crate::core::install::runtime::JreManager::resolve_component_name(
+            Some(&ctx.mc_version),
+            None,
+            comp_from_json.as_deref(),
+        );
+
+        let required_major = match java_component {
+            "java-runtime-delta" => 21u8,
+            "java-runtime-gamma" => 17u8,
+            "java-runtime-beta" => 17u8,
+            "java-runtime-alpha" => 16u8,
+            _ => 8u8,
+        };
+
+        // 2. Download/Ensure JRE is available or fall back to system Java
+        let mut resolved_java_bin = None;
+        if let Ok(jre_path) = crate::core::install::mojang::download_jre(java_component).await {
+            let bin = if cfg!(windows) {
+                jre_path.join("bin/java.exe")
+            } else {
+                jre_path.join("bin/java")
+            };
+            if bin.exists() {
+                resolved_java_bin = Some(bin);
+            }
+        }
+
+        let java_bin = if let Some(bin) = resolved_java_bin {
+            bin
         } else {
-            jre_path.join("bin/java")
+            log::info!(
+                "Mojang JRE not available for component {}, finding system JVM for major {}",
+                java_component,
+                required_major
+            );
+            let (_, bin, _) = crate::core::launch::args::find_java(Some(required_major), &ctx.mc_path)?;
+            bin
         };
 
         // 3. Ensure launcher_profiles.json exists (Forge installer requires it)
         let profiles_path = ctx.mc_path.join("launcher_profiles.json");
-        if !profiles_path.exists() {
-            let _ = fs::write(&profiles_path, "{ \"profiles\": {} }");
+        let needs_profile = if profiles_path.exists() {
+            match fs::read_to_string(&profiles_path) {
+                Ok(c) => c.trim().is_empty() || serde_json::from_str::<Value>(&c).is_err(),
+                Err(_) => true,
+            }
+        } else {
+            true
+        };
+        if needs_profile {
+            let _ = fs::write(&profiles_path, "{\n  \"profiles\": {}\n}\n");
         }
 
         log::info!("Running Forge Installer natively using java: {:?}", java_bin);
         
-        // 4. Execute Forge Installer headlessly
-        let mut cmd = std::process::Command::new(&java_bin);
+        // 4. Execute Forge Installer headlessly (asynchronously via tokio process)
+        let mut cmd = tokio::process::Command::new(&java_bin);
         cmd.current_dir(&ctx.mc_path)
             .arg("-jar")
             .arg(&ctx.installer_path)
@@ -324,12 +363,12 @@ impl ForgeVersionInstallStrategy for ModernForgeInstallStrategy {
 
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000);
         }
 
         let output = cmd
             .output()
+            .await
             .map_err(|e| format!("Failed to execute Forge installer: {}", e))?;
 
         if !output.status.success() {
@@ -408,7 +447,24 @@ impl ForgeVersionInstallStrategy for ModernForgeInstallStrategy {
             }
         }
 
-        // 6. Verify manifest libraries
+        // 6. Verify that the client jar produced by installer processors actually exists on disk
+        let forge_client_jar = ctx
+            .mc_path
+            .join("libraries")
+            .join("net")
+            .join("minecraftforge")
+            .join("forge")
+            .join(format!("{}-{}", ctx.mc_version, ctx.forge_version))
+            .join(format!("forge-{}-{}-client.jar", ctx.mc_version, ctx.forge_version));
+
+        if !forge_client_jar.exists() {
+            return Err(format!(
+                "Forge installer completed but did not produce expected client JAR at {:?}",
+                forge_client_jar
+            ));
+        }
+
+        // 7. Verify manifest libraries
         let content = fs::read_to_string(&ctx.installed_json)
             .map_err(|e| format!("Failed to read generated version json: {}", e))?;
         let manifest: VersionManifest = serde_json::from_str(&content)
@@ -423,7 +479,12 @@ impl ForgeVersionInstallStrategy for ModernForgeInstallStrategy {
 
 async fn ensure_installer_downloaded(client: &Client, ctx: &ForgeInstallContext) -> Result<(), String> {
     if ctx.installer_path.exists() {
-        return Ok(());
+        if let Ok(meta) = fs::metadata(&ctx.installer_path) {
+            if meta.len() > 100_000 {
+                return Ok(());
+            }
+        }
+        let _ = tokio_fs::remove_file(&ctx.installer_path).await;
     }
 
     let url = format!(
@@ -464,7 +525,7 @@ async fn ensure_installer_downloaded(client: &Client, ctx: &ForgeInstallContext)
     Ok(())
 }
 
-fn is_legacy_forge_layout(mc_version: &str) -> bool {
+pub fn is_legacy_forge_layout(mc_version: &str) -> bool {
     let parts: Vec<&str> = mc_version.split('.').collect();
     if parts.len() < 2 {
         return false;
@@ -474,6 +535,22 @@ fn is_legacy_forge_layout(mc_version: &str) -> bool {
     let minor = parts[1].parse::<u32>().ok();
 
     matches!((major, minor), (Some(1), Some(m)) if m < 13)
+}
+
+fn extract_mcp_version(manifest: &VersionManifest) -> Option<String> {
+    if let Some(args) = &manifest.arguments {
+        let mut iter = args.game.iter();
+        while let Some(arg) = iter.next() {
+            if let Value::String(s) = arg {
+                if s == "--fml.mcpVersion" {
+                    if let Some(Value::String(val)) = iter.next() {
+                        return Some(val.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn set_json_id(value: &mut Value, id: &str) -> Result<(), String> {
@@ -737,23 +814,105 @@ async fn download_file_stream(client: &Client, url: &str, destination: &Path) ->
 pub async fn is_forge_installed(mc_version: &str, forge_version: &str) -> bool {
     if let Ok(mc_path) = get_official_mc_path().await {
         let forge_id = format!("{}-forge-{}", mc_version, forge_version);
-        mc_path
+        let json_exists = mc_path
             .join("versions")
             .join(&forge_id)
             .join(format!("{}.json", forge_id))
-            .exists()
+            .exists();
+
+        if !json_exists {
+            return false;
+        }
+
+        if is_legacy_forge_layout(mc_version) {
+            let lib_dir = mc_path
+                .join("libraries")
+                .join("net")
+                .join("minecraftforge")
+                .join("forge")
+                .join(format!("{}-{}", mc_version, forge_version));
+            lib_dir.join(format!("forge-{}-{}.jar", mc_version, forge_version)).exists()
+                || lib_dir.join(format!("forge-{}-{}-universal.jar", mc_version, forge_version)).exists()
+        } else {
+            let client_jar = mc_path
+                .join("libraries")
+                .join("net")
+                .join("minecraftforge")
+                .join("forge")
+                .join(format!("{}-{}", mc_version, forge_version))
+                .join(format!("forge-{}-{}-client.jar", mc_version, forge_version));
+            client_jar.exists()
+        }
     } else {
         false
     }
 }
 
 async fn ensure_existing_installation(client: &Client, ctx: &ForgeInstallContext) -> Result<(), String> {
+    // 1. Critical check: Verify presence of the Forge client / universal jar on disk
+    if !is_legacy_forge_layout(&ctx.mc_version) {
+        let forge_client_jar = ctx
+            .mc_path
+            .join("libraries")
+            .join("net")
+            .join("minecraftforge")
+            .join("forge")
+            .join(format!("{}-{}", ctx.mc_version, ctx.forge_version))
+            .join(format!("forge-{}-{}-client.jar", ctx.mc_version, ctx.forge_version));
+
+        if !forge_client_jar.exists() {
+            log::warn!("Modern Forge client JAR is missing on disk: {:?}", forge_client_jar);
+            return Err(format!("Modern Forge client JAR is missing: {:?}", forge_client_jar));
+        }
+    } else {
+        let lib_dir = ctx
+            .mc_path
+            .join("libraries")
+            .join("net")
+            .join("minecraftforge")
+            .join("forge")
+            .join(format!("{}-{}", ctx.mc_version, ctx.forge_version));
+        let dest_jar = lib_dir.join(format!("forge-{}-{}.jar", ctx.mc_version, ctx.forge_version));
+        let dest_universal_jar = lib_dir.join(format!("forge-{}-{}-universal.jar", ctx.mc_version, ctx.forge_version));
+        if !dest_jar.exists() && !dest_universal_jar.exists() {
+            log::warn!("Legacy Forge JAR is missing on disk: {:?}", lib_dir);
+            return Err("Legacy Forge JAR is missing".to_string());
+        }
+    }
+
     let content = tokio_fs::read_to_string(&ctx.installed_json)
         .await
         .map_err(|e| format!("Failed to read existing forge version JSON: {}", e))?;
 
     let manifest: VersionManifest = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse existing forge version manifest: {}", e))?;
+
+    if !is_legacy_forge_layout(&ctx.mc_version) {
+        if let Some(mcp_ver) = extract_mcp_version(&manifest) {
+            let client_srg = ctx
+                .mc_path
+                .join("libraries")
+                .join("net")
+                .join("minecraft")
+                .join("client")
+                .join(format!("{}-{}", ctx.mc_version, mcp_ver))
+                .join(format!("client-{}-{}-srg.jar", ctx.mc_version, mcp_ver));
+
+            let client_extra = ctx
+                .mc_path
+                .join("libraries")
+                .join("net")
+                .join("minecraft")
+                .join("client")
+                .join(format!("{}-{}", ctx.mc_version, mcp_ver))
+                .join(format!("client-{}-{}-extra.jar", ctx.mc_version, mcp_ver));
+
+            if !client_srg.exists() || !client_extra.exists() {
+                log::warn!("Modern Forge client srg or extra JAR is missing on disk: {:?}, {:?}", client_srg, client_extra);
+                return Err("Modern Forge client srg or extra JAR is missing".to_string());
+            }
+        }
+    }
 
     ensure_manifest_libraries(client, &ctx.mc_path, &manifest).await?;
 
@@ -796,4 +955,45 @@ async fn ensure_existing_installation(client: &Client, ctx: &ForgeInstallContext
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_legacy_forge_layout() {
+        assert!(is_legacy_forge_layout("1.12.2"));
+        assert!(is_legacy_forge_layout("1.7.10"));
+        assert!(!is_legacy_forge_layout("1.13"));
+        assert!(!is_legacy_forge_layout("1.16.5"));
+        assert!(!is_legacy_forge_layout("1.20.1"));
+        assert!(!is_legacy_forge_layout("1.21.1"));
+    }
+
+    #[test]
+    fn test_extract_mcp_version() {
+        let manifest_json = serde_json::json!({
+            "id": "1.20.1-forge-47.4.0",
+            "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "libraries": [],
+            "arguments": {
+                "game": [
+                    "--launchTarget", "forgeclient",
+                    "--fml.forgeVersion", "47.4.0",
+                    "--fml.mcVersion", "1.20.1",
+                    "--fml.mcpVersion", "20230612.114412"
+                ],
+                "jvm": []
+            }
+        });
+        let manifest: VersionManifest = serde_json::from_value(manifest_json).unwrap();
+        assert_eq!(extract_mcp_version(&manifest), Some("20230612.114412".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_is_forge_installed_returns_false_for_missing() {
+        let installed = is_forge_installed("1.20.1", "99.99.99").await;
+        assert!(!installed);
+    }
 }
